@@ -1,0 +1,52 @@
+name: Add Product Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: "Product links (space ya comma se alag karein)"
+        required: true
+        type: string
+  repository_dispatch:
+    types: [add-product]   # client_payload: {"urls": "https://... https://..."}
+
+permissions:
+  contents: write
+
+# Ek time par ek hi run, warna git push conflict hoga
+concurrency:
+  group: product-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # GH_PAT ho to wahi, warna default GITHUB_TOKEN
+          token: ${{ secrets.GH_PAT || github.token }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Generate review & push
+        env:
+          PRODUCT_URLS: ${{ inputs.urls || github.event.client_payload.urls }}
+          PAGES_DEPLOY_WAIT: "90"
+          SITE_BASE_URL: ${{ vars.SITE_BASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
+          TECHGLOW_GH_TOKEN: ${{ secrets.TECHGLOW_GH_TOKEN }}
+          TECHGLOW_WORKFLOW: ${{ vars.TECHGLOW_WORKFLOW }}
+        run: python amazon_to_blogger.py
