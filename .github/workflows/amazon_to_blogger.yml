@@ -11,7 +11,7 @@ on:
     types: [add-product]   # client_payload: {"urls": "https://... https://..."}
 
 permissions:
-  contents: write
+  contents: read
 
 # Ek time par ek hi run, warna git push conflict hoga
 concurrency:
@@ -23,21 +23,33 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      # 1) Is repo (amazon_to_blogger) ka code -> bot/ folder me
+      - name: Checkout script repo
+        uses: actions/checkout@v4
         with:
+          path: bot
+
+      # 2) Asli website repo (bgtech) -> site/ folder me (GH_PAT se, taaki push ho sake)
+      - name: Checkout site repo (bgtech)
+        uses: actions/checkout@v4
+        with:
+          repository: bgtechlab/bgtech
+          token: ${{ secrets.GH_PAT }}
+          path: site
           fetch-depth: 0
-          # GH_PAT ho to wahi, warna default GITHUB_TOKEN
-          token: ${{ secrets.GH_PAT || github.token }}
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
+          cache-dependency-path: bot/requirements.txt
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r bot/requirements.txt
 
-      - name: Generate review & push
+      # 3) Script site/ folder ke andar chalti hai: data/, build.py aur git push sab bgtech me
+      - name: Generate review & push to bgtech
+        working-directory: site
         env:
           PRODUCT_URLS: ${{ inputs.urls || github.event.client_payload.urls }}
           PAGES_DEPLOY_WAIT: "90"
@@ -49,4 +61,4 @@ jobs:
           MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
           TECHGLOW_GH_TOKEN: ${{ secrets.TECHGLOW_GH_TOKEN }}
           TECHGLOW_WORKFLOW: ${{ vars.TECHGLOW_WORKFLOW }}
-        run: python amazon_to_blogger.py
+        run: python ../bot/amazon_to_blogger.py
