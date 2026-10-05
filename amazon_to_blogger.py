@@ -958,12 +958,20 @@ async def process_and_publish(buy_url):
         clean_tag = re.sub(r'[^a-zA-Z0-9]', '', short_name)
         social_caption = f"Check out the best deal on {short_name}! ✨ Get yours at the best price of {product['price']} today!\n\n#BestDeals #{category_tag} #{clean_tag} #OnlineShopping"
 
+    # Pinterest caption limit: keep a safety margin below Pinterest's 800-character limit.
+    # Make.com maps this field as {{2.caption}}, so enforce the limit before sending the webhook.
+    pinterest_caption = social_caption.strip()
+    if len(pinterest_caption) > 790:
+        pinterest_caption = pinterest_caption[:790].rsplit(" ", 1)[0].rstrip()
+        if not pinterest_caption:
+            pinterest_caption = social_caption.strip()[:790]
+    
     try:
         payload = {
             "title": short_name,
             "category": product["category"],
             "image_url": main_image,
-            "caption": social_caption,
+            "caption": pinterest_caption,
             "message": social_caption,
             "social_caption": social_caption,
             "deal_url": page_url,
