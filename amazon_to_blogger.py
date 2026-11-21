@@ -1218,13 +1218,17 @@ async def process_and_publish(buy_url):
             f"\n\n#BestDeals #{category_tag} #{clean_tag} #OnlineShopping"
         )
 
-    # Pinterest limit ko dhyan me rakhte hue same caption teeno platforms ko bhejo.
+    # Pinterest ki 500-character limit ke andar same caption teeno platforms par rakho.
     link_suffix = f"\n\n🛒 Buy here: {buy_url}\n📖 Read review: {page_url}"
-    caption_budget = max(0, 790 - len(link_suffix))
+    pinterest_safe_limit = 480  # 20 characters ka safety margin
+    caption_budget = max(0, pinterest_safe_limit - len(link_suffix))
     base_caption = social_caption.strip()
     if len(base_caption) > caption_budget:
         base_caption = base_caption[:caption_budget].rsplit(" ", 1)[0].rstrip()
     shared_caption = f"{base_caption}{link_suffix}"
+    if len(shared_caption) > 500:
+        # Bahut lamba affiliate/review URL ho to bhi hard limit enforce karo.
+        shared_caption = shared_caption[:500].rstrip()
 
     if BUFFER_ACCESS_TOKEN:
         buffer_ok = send_product_post_to_buffer(
