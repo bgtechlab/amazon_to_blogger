@@ -1,0 +1,24 @@
+name: Validate Amazon to Blogger Buffer Integration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "amazon_to_blogger.py"
+      - ".github/workflows/amazon_to_blogger.yml"
+      - ".github/workflows/buffer-integration-check.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile Python script (no publishing)
+        run: python -m py_compile amazon_to_blogger.py
