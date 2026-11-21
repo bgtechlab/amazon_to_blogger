@@ -123,8 +123,9 @@ if not GROQ_API_KEY:
 # ================= 2. ADVANCED SCRAPER & HELPERS =================
 def unshorten_and_resolve_url(url, session):
     """
-    Traces short links (fktr.in, amzn.to, earnkaro, linkredirect.in, etc.)
-    and unpacks hidden target query parameters (dl=, url=) until the real store page is reached.
+    Resolve Amazon (including link.amazon) and Flipkart (including fktr.in)
+    short links. Android intent:// redirects are converted to their HTTPS
+    browser fallback before another HTTP request is attempted.
     """
     headers = {
         "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36",
@@ -133,49 +134,90 @@ def unshorten_and_resolve_url(url, session):
     }
     session.headers.update(headers)
 
-    current_url = url.strip()
-    for _ in range(6):
-        # 1. Query parameter dl= ya url= decode karo
-        if "dl=" in current_url or "url=" in current_url:
-            parsed = urllib.parse.urlparse(current_url)
-            qs = urllib.parse.parse_qs(parsed.query)
-            if "dl" in qs and qs["dl"][0]:
-                current_url = urllib.parse.unquote(qs["dl"][0])
-            elif "url" in qs and qs["url"][0]:
-                current_url = urllib.parse.unquote(qs["url"][0])
+    def normalize_target(target):
+        target = (target or "").strip()
+        if target.lower().startswith("intent://"):
+            intent_parts = target.split("#Intent;", 1)
+            if len(intent_parts) == 2:
+                fragment = intent_parts[1]
+                fallback = re.search(r"(?:^|;)S\.browser_fallback_url=([^;]+)", fragment)
+                if fallback:
+                    candidate = fallback.group(1)
+                    for _ in range(2):
+                        candidate = urllib.parse.unquote(candidate)
+                    if candidate.startswith(("https://", "http://")):
+                        return candidate
+                if re.search(r"(?:^|;)scheme=https(?:;|$)", fragment):
+                    return "https://" + intent_parts[0][len("intent://"):]
+        return target
 
-        if any(d in current_url for d in ["flipkart.com", "amazon.in", "amazon.com"]):
-            if not any(wrap in current_url for wrap in ["linkredirect.in", "fktr.in", "earnkaro"]):
-                break
+    current_url = normalize_target(url)
+    for _ in range(8):
+        current_url = normalize_target(current_url)
+
+        if not current_url.startswith(("http://", "https://")):
+            logging.warning(f"⚠️ Unsupported redirect scheme; cannot fetch: {current_url[:80]}")
+            break
+
+        # Stop once the final product-store URL is reached.
+        host = urllib.parse.urlparse(current_url).netloc.lower()
+        if host.endswith(("flipkart.com", "amazon.in", "amazon.com")):
+            break
 
         try:
-            logging.info(f"🔍 Tracing redirect for: {current_url[:60]}...")
-            res = session.get(current_url, allow_redirects=True, timeout=15)
-            current_url = res.url
+            logging.info(f"🔍 Tracing redirect for: {current_url[:80]}...")
+            # Handle redirects manually: requests must not try to follow
+            # Android intent:// locations (which are not HTTP URLs).
+            res = session.get(current_url, allow_redirects=False, timeout=15)
 
-            if "dl=" in current_url or "url=" in current_url:
-                continue
+            if res.is_redirect or res.is_permanent_redirect or res.status_code in (301, 302, 303, 307, 308):
+                location = res.headers.get("Location", "")
+                if location:
+                    current_url = normalize_target(urllib.parse.urljoin(current_url, location))
+                    continue
 
             soup = BeautifulSoup(res.content, "html.parser")
-            
+
             meta_refresh = soup.find("meta", attrs={"http-equiv": re.compile(r"refresh", re.I)})
             if meta_refresh and meta_refresh.get("content"):
                 match = re.search(r"url=['\"]?(.*?)['\"]?$", meta_refresh.get("content"), re.I)
                 if match:
-                    current_url = urllib.parse.unquote(match.group(1).strip())
+                    current_url = normalize_target(urllib.parse.urljoin(current_url, match.group(1).strip()))
                     continue
 
-            target_match = re.search(r"['\"](https://(?:www\.|dl\.)?(?:flipkart\.com|amazon\.in|amazon\.com)[^'\"]+)['\"]", res.text)
-            if target_match:
-                current_url = target_match.group(1).strip()
-                break
+            # Some shorteners put the destination in page source or query params.
+            parsed = urllib.parse.urlparse(current_url)
+            qs = urllib.parse.parse_qs(parsed.query)
+            nested = qs.get("dl", [None])[0] or qs.get("url", [None])[0]
+            if nested:
+                current_url = normalize_target(urllib.parse.unquote(nested))
+                continue
 
-        except Exception as e:
-            logging.warning(f"⚠️ Redirect resolution failed: {e}")
+            target_match = re.search(
+                r"['\"](https://(?:www\.|dl\.)?(?:flipkart\.com|amazon\.(?:in|com))[^'\"]+)['\"]",
+                res.text,
+                re.IGNORECASE
+            )
+            if target_match:
+                current_url = normalize_target(target_match.group(1).strip())
+                continue
+
+            # No further redirect was exposed by this shortener.
+            if res.status_code < 400:
+                current_url = res.url or current_url
             break
 
+        except requests.RequestException as e:
+            logging.warning(f"⚠️ Redirect resolution failed for {current_url[:80]}: {e}")
+            break
+
+    current_url = normalize_target(current_url)
     asin_match = re.search(r'([B0-9][A-Z0-9]{9})', current_url, re.IGNORECASE)
-    if "amazon" in current_url and asin_match and "/dp/" not in current_url:
+    if "amazon" in current_url.lower() and asin_match and "/dp/" not in current_url:
+        # Keep affiliate/tracking parameters whenever the short link exposed them.
+        parsed = urllib.parse.urlparse(current_url)
+        if parsed.scheme in ("http", "https") and parsed.netloc.endswith(("amazon.in", "amazon.com")):
+            return current_url
         return f"https://www.amazon.in/dp/{asin_match.group(1)}"
 
     return current_url
