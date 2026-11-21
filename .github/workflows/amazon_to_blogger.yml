@@ -58,7 +58,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
+          BUFFER_ACCESS_TOKEN: ${{ secrets.BUFFER_ACCESS_TOKEN }}
           TECHGLOW_GH_TOKEN: ${{ secrets.TECHGLOW_GH_TOKEN }}
           TECHGLOW_WORKFLOW: ${{ vars.TECHGLOW_WORKFLOW }}
         run: python ../bot/amazon_to_blogger.py
