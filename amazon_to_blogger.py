@@ -50,7 +50,7 @@ for _noisy in ("httpx", "httpcore"):
 # ================= 1. CONFIGURATION & CATEGORIES =================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-MAKE_WEBHOOK_URL = os.getenv("MAKE_WEBHOOK_URL", "")
+BUFFER_ACCESS_TOKEN = os.getenv("BUFFER_ACCESS_TOKEN", "").strip()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-3.6-flash"
@@ -896,6 +896,159 @@ def git_commit_and_push(message):
         logging.error(f"⚠️ Git push failed: {e}")
         return False
 
+
+# ================= 5.5 BUFFER SOCIAL PUBLISHER =================
+def get_buffer_channels():
+    """Buffer account se connected Facebook, Instagram aur Pinterest channels leta hai."""
+    if not BUFFER_ACCESS_TOKEN:
+        logging.warning("⚠️ BUFFER_ACCESS_TOKEN missing — social posting skip.")
+        return []
+
+    api_url = "https://api.buffer.com"
+    headers = {
+        "Authorization": f"Bearer {BUFFER_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    try:
+        org_query = "query { account { organizations { id name } } }"
+        org_res = requests.post(api_url, json={"query": org_query}, headers=headers, timeout=20)
+        org_res.raise_for_status()
+        org_data = org_res.json()
+        if org_data.get("errors"):
+            raise RuntimeError(str(org_data["errors"])[:400])
+        orgs = org_data.get("data", {}).get("account", {}).get("organizations", [])
+        if not orgs:
+            logging.error("❌ Buffer account mein organization nahi mili.")
+            return []
+
+        org_id = orgs[0]["id"]
+        channel_query = """
+        query GetChannels($input: ChannelsInput!) {
+          channels(input: $input) {
+            id service name
+            metadata {
+              ... on PinterestMetadata {
+                boards { serviceId name }
+              }
+            }
+          }
+        }
+        """
+        channel_res = requests.post(
+            api_url,
+            json={"query": channel_query, "variables": {"input": {"organizationId": org_id}}},
+            headers=headers,
+            timeout=20,
+        )
+        channel_res.raise_for_status()
+        channel_data = channel_res.json()
+        if channel_data.get("errors"):
+            raise RuntimeError(str(channel_data["errors"])[:400])
+
+        supported = {"facebook", "instagram", "pinterest"}
+        channels = []
+        for channel in channel_data.get("data", {}).get("channels", []):
+            service = (channel.get("service") or "").lower()
+            if service not in supported:
+                continue
+            boards = (channel.get("metadata") or {}).get("boards") or []
+            board_id = boards[0].get("serviceId") if boards else None
+            if service == "pinterest" and not board_id:
+                logging.warning("⚠️ Pinterest channel %s skip: Buffer mein board nahi mila.", channel.get("name", ""))
+                continue
+            channels.append({
+                "id": channel["id"],
+                "service": service,
+                "name": channel.get("name") or service,
+                "board_id": board_id,
+            })
+        for channel in channels:
+            logging.info("📱 Buffer channel: %s (%s)", channel["name"], channel["service"])
+        return channels
+    except Exception as exc:
+        logging.error("❌ Buffer channels fetch failed: %s", exc)
+        return []
+
+
+def send_product_post_to_buffer(image_url, title, caption, buy_url):
+    """Ek hi product image aur caption ko FB, Instagram aur Pinterest ke Buffer queues mein bhejta hai."""
+    if not BUFFER_ACCESS_TOKEN:
+        logging.warning("⚠️ BUFFER_ACCESS_TOKEN missing — Buffer post nahi bheji.")
+        return False
+    if not image_url or not image_url.startswith(("https://", "http://")):
+        logging.error("❌ Buffer post skip: valid public product image URL nahi mili.")
+        return False
+
+    channels = get_buffer_channels()
+    if not channels:
+        logging.error("❌ Buffer par Facebook/Instagram/Pinterest channels nahi mile.")
+        return False
+
+    api_url = "https://api.buffer.com"
+    headers = {
+        "Authorization": f"Bearer {BUFFER_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    mutation = """
+    mutation CreatePost($input: CreatePostInput!) {
+      createPost(input: $input) {
+        ... on PostActionSuccess { post { id } }
+        ... on MutationError { message }
+      }
+    }
+    """
+
+    all_ok = True
+    for channel in channels:
+        service = channel["service"]
+        metadata = {}
+        if service == "facebook":
+            metadata = {"facebook": {"type": "post"}}
+        elif service == "instagram":
+            metadata = {"instagram": {"type": "post", "shouldShareToFeed": True}}
+        elif service == "pinterest":
+            metadata = {
+                "pinterest": {
+                    "boardServiceId": channel["board_id"],
+                    "title": (title or "Product Deal")[:100],
+                    "url": buy_url,
+                }
+            }
+
+        variables = {
+            "input": {
+                "channelId": channel["id"],
+                "text": caption,
+                "mode": "addToQueue",
+                "schedulingType": "automatic",
+                "assets": [{"image": {"url": image_url}}],
+                "metadata": metadata,
+            }
+        }
+        try:
+            response = requests.post(
+                api_url,
+                json={"query": mutation, "variables": variables},
+                headers=headers,
+                timeout=30,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("errors"):
+                raise RuntimeError(str(payload["errors"])[:500])
+            result = payload.get("data", {}).get("createPost", {})
+            post_id = result.get("post", {}).get("id")
+            if post_id:
+                logging.info("✅ Buffer queue mein add: %s (%s), post ID=%s", channel["name"], service, post_id)
+            else:
+                all_ok = False
+                logging.error("❌ Buffer %s (%s): %s", channel["name"], service, result.get("message") or payload)
+        except Exception as exc:
+            all_ok = False
+            logging.error("❌ Buffer post failed for %s (%s): %s", channel["name"], service, exc)
+    return all_ok
+
+
 # ================= 6. MAIN PROCESS =================
 async def process_and_publish(buy_url):
     product = scrape_product_details(buy_url)
@@ -984,52 +1137,48 @@ async def process_and_publish(buy_url):
     except Exception as e:
         logging.error(f"⚠️ Telegram Error: {e}")
 
-    # 5. Make.com Webhook & Social Caption
+    # 5. Buffer social posts (same image + same caption on all three platforms)
     category_tag = product["category"].replace(" ", "").replace("&", "")
     social_prompt = f"""
-    Write an attractive social media caption for Instagram, Facebook & Pinterest for:
+    Write one attractive social media caption for Instagram, Facebook & Pinterest for:
     Product: {short_name}
     Category: {product['category']}
     Price: {product['price']}
 
-    Keep it engaging with relevant emojis, clear value point, and hashtags.
+    Keep it engaging with relevant emojis, a clear value point, and hashtags.
+    Do not invent product specifications or claims.
     """
-    
+
     social_caption = get_ai_response(social_prompt)
     if not social_caption or len(social_caption.strip()) < 20:
         clean_tag = re.sub(r'[^a-zA-Z0-9]', '', short_name)
-        social_caption = f"Check out the best deal on {short_name}! ✨ Get yours at the best price of {product['price']} today!\n\n#BestDeals #{category_tag} #{clean_tag} #OnlineShopping"
+        social_caption = (
+            f"Check out the deal on {short_name}! ✨ "
+            f"Check the latest price: {product['price']}."
+            f"\n\n#BestDeals #{category_tag} #{clean_tag} #OnlineShopping"
+        )
 
-    # Pinterest caption limit: keep a safety margin below Pinterest's 800-character limit.
-    # Make.com maps this field as {{2.caption}}, so enforce the limit before sending the webhook.
-    pinterest_caption = social_caption.strip()
-    if len(pinterest_caption) > 790:
-        pinterest_caption = pinterest_caption[:790].rsplit(" ", 1)[0].rstrip()
-        if not pinterest_caption:
-            pinterest_caption = social_caption.strip()[:790]
-    
-    try:
-        payload = {
-            "title": short_name,
-            "category": product["category"],
-            "image_url": main_image,
-            "caption": pinterest_caption,
-            "message": social_caption,
-            "social_caption": social_caption,
-            "deal_url": page_url,
-            "amazon_url": buy_url,
-            "price": product["price"]
-        }
-        if MAKE_WEBHOOK_URL:
-            response = requests.post(MAKE_WEBHOOK_URL, json=payload, timeout=10)
-            if response.status_code == 200:
-                logging.info(f"🎉 Make.com Webhook Triggered! Status: {response.status_code}")
-            else:
-                logging.warning(f"⚠️ Make.com Webhook returned status code {response.status_code}")
+    # Pinterest limit ko dhyan me rakhte hue same caption teeno platforms ko bhejo.
+    link_suffix = f"\n\n🛒 Buy here: {buy_url}\n📖 Read review: {page_url}"
+    caption_budget = max(0, 790 - len(link_suffix))
+    base_caption = social_caption.strip()
+    if len(base_caption) > caption_budget:
+        base_caption = base_caption[:caption_budget].rsplit(" ", 1)[0].rstrip()
+    shared_caption = f"{base_caption}{link_suffix}"
+
+    if BUFFER_ACCESS_TOKEN:
+        buffer_ok = send_product_post_to_buffer(
+            image_url=main_image,
+            title=short_name,
+            caption=shared_caption,
+            buy_url=buy_url,
+        )
+        if buffer_ok:
+            logging.info("🎉 Same product image + caption Facebook, Instagram aur Pinterest ke Buffer queues mein add ho gaye.")
         else:
-            logging.info("ℹ️ MAKE_WEBHOOK_URL .env mein missing hai — Webhook skip ho gaya.")
-    except Exception as e:
-        logging.error(f"⚠️ Webhook Error: {e}")
+            logging.warning("⚠️ Buffer par ek ya zyada social posts add nahi ho payi.")
+    else:
+        logging.warning("⚠️ BUFFER_ACCESS_TOKEN GitHub Secret abhi set nahi hai — social posting skip hui.")
 
     return push_ok
 
