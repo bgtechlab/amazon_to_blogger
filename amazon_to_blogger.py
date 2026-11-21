@@ -348,7 +348,7 @@ def detect_product_category(title_text):
     return "Gadgets"
 
 def scrape_product_details(url):
-    logging.info(f"🔄 Scraping Product: {url[:60]}...")
+    logging.info("🔄 Scraping Product: %s...", url[:60])
     data = {
         "title": "",
         "price": "Check Best Price",
@@ -362,131 +362,162 @@ def scrape_product_details(url):
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9,hi;q=0.8"
+        "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     })
 
     res_url = unshorten_and_resolve_url(url, session)
+    asin_match = re.search(r"/(?:dp|gp/product|gp/aw/d)/([A-Z0-9]{10})", res_url, re.I)
+    if not asin_match:
+        asin_match = re.search(r"/([B0-9][A-Z0-9]{9})(?:[/?#]|$)", res_url, re.I)
+    asin = asin_match.group(1).upper() if asin_match else ""
 
-    try:
-        res = session.get(res_url, allow_redirects=True, timeout=20)
-        soup = BeautifulSoup(res.content, "html.parser")
+    candidate_urls = [res_url]
+    if asin:
+        candidate_urls.extend([
+            f"https://www.amazon.in/gp/aw/d/{asin}",
+            f"https://www.amazon.in/dp/{asin}?th=1&psc=1",
+        ])
 
-        # 1. Title
-        title_elem = (
-            soup.find("meta", {"property": "og:title"})
-            or soup.find("h1")
-            or soup.find("span", {"id": "productTitle"}) 
-            or soup.find("span", {"class": "VU-Tz5"})
-            or soup.find("meta", {"name": "twitter:title"})
-        )
-        if title_elem:
-            raw_title = title_elem.get("content") if title_elem.name == "meta" else title_elem.get_text()
-            clean_title = raw_title.strip().replace("\n", " ")
-            clean_title = re.sub(r"\s*:\s*Amazon\..*$", "", clean_title, flags=re.IGNORECASE)
-            data["title"] = clean_title
+    soup = None
+    response = None
+    seen_urls = set()
+    for candidate in candidate_urls:
+        if candidate in seen_urls:
+            continue
+        seen_urls.add(candidate)
+        try:
+            logging.info("🔎 Amazon product page attempt: %s", candidate[:110])
+            attempt = session.get(candidate, allow_redirects=True, timeout=25)
+            logging.info("ℹ️ Product page HTTP %s; final host=%s; bytes=%s",
+                         attempt.status_code,
+                         urllib.parse.urlparse(attempt.url).netloc,
+                         len(attempt.content or b""))
+            if attempt.status_code >= 400:
+                logging.warning("⚠️ Product page returned HTTP %s", attempt.status_code)
+                continue
 
-        # Title URL Slug fallback if blocked
-        if (not data["title"] or data["title"] in ["Flipkart store 2", "Amazon.in", "Online Shopping"]) and "/p/" in res_url:
-            slug_match = re.search(r"flipkart\.com/([^/]+)/p/", res_url)
-            if slug_match:
-                slug_words = slug_match.group(1).replace("-", " ").title()
-                data["title"] = slug_words
+            attempt_soup = BeautifulSoup(attempt.content, "html.parser")
+            page_text = attempt_soup.get_text(" ", strip=True).lower()
+            page_title = (attempt_soup.title.get_text(" ", strip=True)
+                          if attempt_soup.title else "")
+            blocked_markers = ("robot check", "captcha", "sorry! something went wrong",
+                               "automated access", "enter the characters you see below")
+            if any(marker in (page_title + " " + page_text[:2500]).lower()
+                   for marker in blocked_markers):
+                logging.warning("⚠️ Amazon ne automated/robot-check page diya: %s", page_title[:100])
+                continue
 
-        # 2. Images
-        images = []
-        og_img = soup.find("meta", {"property": "og:image"})
-        if og_img and og_img.get("content"):
-            img_c = clean_image_url(og_img.get("content"))
-            if img_c and "ckassets" not in img_c:
-                images.append(img_c)
+            title_candidate = (
+                attempt_soup.find("meta", {"property": "og:title"})
+                or attempt_soup.find("span", {"id": "productTitle"})
+                or attempt_soup.find("h1")
+                or attempt_soup.find("meta", {"name": "twitter:title"})
+            )
+            candidate_title = ""
+            if title_candidate:
+                candidate_title = (title_candidate.get("content") if title_candidate.name == "meta"
+                                   else title_candidate.get_text(" ", strip=True)) or ""
+            candidate_title = candidate_title.strip()
+            invalid_titles = {"", "amazon.in", "online shopping", "best deal online", "robot check"}
+            if candidate_title.lower() not in invalid_titles and "amazon.in" not in candidate_title.lower():
+                response, soup = attempt, attempt_soup
+                data["title"] = re.sub(r"\\s*[:\\-]\\s*Amazon\\..*$", "", candidate_title, flags=re.I).strip()
+                logging.info("✅ Product title extracted from Amazon page.")
+                break
 
-        script_imgs = re.findall(r'"hiRes":"(https://m.media-amazon.com/images/I/[^"]+)"', res.text)
-        if not script_imgs:
-            script_imgs = re.findall(r'"large":"(https://m.media-amazon.com/images/I/[^"]+)"', res.text)
-            
-        for img_url in script_imgs:
-            cleaned = clean_image_url(img_url)
-            if cleaned and cleaned not in images:
-                images.append(cleaned)
+            # Product JSON-LD can contain title/image even when normal page markup differs.
+            for ld in attempt_soup.find_all("script", type="application/ld+json"):
+                try:
+                    payload = json.loads(ld.string or ld.get_text() or "{}")
+                    entries = payload if isinstance(payload, list) else [payload]
+                    for entry in entries:
+                        if isinstance(entry, dict) and isinstance(entry.get("@graph"), list):
+                            entries.extend(x for x in entry["@graph"] if isinstance(x, dict))
+                    for entry in entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        kind = entry.get("@type", [])
+                        if isinstance(kind, str):
+                            kind = [kind]
+                        if any("Product" in str(k) for k in kind):
+                            ld_title = (entry.get("name") or "").strip()
+                            if ld_title:
+                                data["title"] = ld_title
+                            ld_image = entry.get("image")
+                            if isinstance(ld_image, str):
+                                data["images"].append(ld_image)
+                            elif isinstance(ld_image, list):
+                                data["images"].extend(x for x in ld_image if isinstance(x, str))
+                            if data["title"]:
+                                response, soup = attempt, attempt_soup
+                                logging.info("✅ Product details extracted from JSON-LD metadata.")
+                                break
+                    if data["title"]:
+                        break
+                except (ValueError, TypeError):
+                    continue
+            if data["title"]:
+                break
+            logging.warning("⚠️ Page loaded, lekin product title markup nahi mila.")
+        except requests.RequestException as exc:
+            logging.warning("⚠️ Product page request failed (%s): %s",
+                            urllib.parse.urlparse(candidate).netloc, exc)
 
-        fk_imgs = soup.find_all("img", {"class": ["_0D5CY0", "q6D3P8", "_2r_T1I", "_396cs4", "v1zwn21u"]})
-        for fk in fk_imgs:
-            src = fk.get("src", "")
-            cleaned = clean_image_url(src)
-            if cleaned and cleaned not in images and "placeholder" not in cleaned and "ckassets" not in cleaned:
-                images.append(cleaned)
-
-        if len(images) < 2:
-            all_imgs = soup.find_all("img")
-            for i in all_imgs:
-                src = i.get("src", "")
-                if ("media-amazon.com/images/I/" in src or "flixcart.com/image/" in src) and not any(x in src for x in ["icon", "logo", "sprite", "GIF", "ckassets"]):
-                    cleaned = clean_image_url(src)
-                    if cleaned and cleaned not in images:
-                        images.append(cleaned)
-
-        valid_images = [img for img in images if img.startswith("http")][:5]
-        if not valid_images:
-            valid_images = [DEFAULT_FALLBACK_IMAGE]
-
-        data["images"] = valid_images
-
-        # 3. Price
-        price_selectors = [
-            ("span", {"class": "a-price-whole"}),
-            ("div", {"class": "Nx9bqj CxhGGd"}),
-            ("div", {"class": "Nx9bqj"}),
-            ("div", {"class": "_30jeq3"}),
-            ("div", {"class": "_30jeq3 _16Jk6d"}),
-            ("div", {"class": "_25bWKC"}),
-            ("div", {"class": "HLT-1-"}),
-        ]
-        for tag, attrs in price_selectors:
-            price_elem = soup.find(tag, attrs)
-            if price_elem:
-                clean_price = re.sub(r"[^\d]", "", price_elem.get_text())
-                if clean_price and len(clean_price) >= 2:
-                    try:
-                        data["price"] = f"₹{int(clean_price):,}"
-                    except ValueError:
-                        data["price"] = f"₹{clean_price}"
-                    break
-
-        # Fallback 1: meta price
-        if data["price"] == "Check Best Price":
-            meta_price = soup.find("meta", {"itemprop": "price"}) or soup.find("meta", {"property": "product:price:amount"})
-            if meta_price and meta_price.get("content"):
-                clean_price = re.sub(r"[^\d]", "", meta_price.get("content"))
-                if clean_price and len(clean_price) >= 2:
-                    try:
-                        data["price"] = f"₹{int(clean_price):,}"
-                    except ValueError:
-                        data["price"] = f"₹{clean_price}"
-
-        # Fallback 2: Regex scanning
-        if data["price"] == "Check Best Price":
-            price_matches = re.findall(r"₹\s?([0-9]{1,3}(?:,[0-9]{2,3})+|[0-9]{2,6})", res.text)
-            for pm in price_matches:
-                clean_num = re.sub(r"[^\d]", "", pm)
-                if clean_num and 50 <= int(clean_num) <= 1000000:
-                    data["price"] = f"₹{int(clean_num):,}"
-                    break
-
-        # 4. Bullets
-        bullet_elems = soup.find(id="feature-bullets")
-        if bullet_elems:
-            bullets_list = [li.get_text().strip() for li in bullet_elems.find_all("li") if li.get_text().strip()]
-            data["bullets"] = " | ".join(bullets_list[:5])
-
-    except Exception as e:
-        logging.error(f"⚠️ Scraping Error: {e}")
-
-    if not data["title"]:
+    if response is None or soup is None or not data["title"]:
+        logging.error("❌ Amazon product details unavailable after %s attempts. Final URL host=%s; ASIN=%s",
+                      len(seen_urls), urllib.parse.urlparse(res_url).netloc, asin or "not found")
         data["title"] = "Best Deal Online"
+        data["category"] = detect_product_category(data["title"])
+        return data
 
-    # Category Detection
+    # Images: Open Graph, Amazon hiRes/large JSON, JSON-LD and product gallery.
+    images = []
+    og_img = soup.find("meta", {"property": "og:image"})
+    if og_img and og_img.get("content"):
+        images.append(clean_image_url(og_img.get("content")))
+    for pattern in (
+        r'"hiRes":"(https://m.media-amazon.com/images/I/[^"]+)"',
+        r'"large":"(https://m.media-amazon.com/images/I/[^"]+)"',
+    ):
+        for img_url in re.findall(pattern, response.text or ""):
+            images.append(clean_image_url(img_url))
+    for img in soup.find_all("img"):
+        src = img.get("src") or img.get("data-old-hires") or img.get("data-a-dynamic-image", "")
+        if src.startswith("{"):
+            try:
+                src = next(iter(json.loads(src).keys()), "")
+            except (ValueError, TypeError):
+                src = ""
+        if "media-amazon.com/images/I/" in src:
+            images.append(clean_image_url(src))
+    data["images"] = list(dict.fromkeys(
+        x for x in images if x.startswith("https://") and "sprite" not in x.lower()
+    ))[:5]
+
+    # Price: page selector, then structured metadata.
+    price_elem = soup.find("span", {"class": "a-price-whole"})
+    if price_elem:
+        digits = re.sub(r"[^0-9]", "", price_elem.get_text())
+        if digits:
+            data["price"] = f"₹{int(digits):,}"
+    if data["price"] == "Check Best Price":
+        price_meta = (soup.find("meta", {"itemprop": "price"})
+                      or soup.find("meta", {"property": "product:price:amount"}))
+        if price_meta and price_meta.get("content"):
+            digits = re.sub(r"[^0-9]", "", price_meta["content"])
+            if digits:
+                data["price"] = f"₹{int(digits):,}"
+
+    bullets = soup.find(id="feature-bullets")
+    if bullets:
+        data["bullets"] = " | ".join(
+            li.get_text(" ", strip=True) for li in bullets.find_all("li")
+            if li.get_text(" ", strip=True)
+        )[:2500]
+
     data["category"] = detect_product_category(data["title"])
-
     return data
 
 # ================= 3. AI CONTENT GENERATOR =================
